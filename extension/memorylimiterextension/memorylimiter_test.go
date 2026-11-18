@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
 	"go.uber.org/zap"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -266,8 +267,28 @@ func TestGRPCUnaryInterceptor_Refused(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Nil(t, resp)
-	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
+	assertRefusedWithRetryInfo(t, err)
 	assert.False(t, called)
+}
+
+// assertRefusedWithRetryInfo asserts that err is RESOURCE_EXHAUSTED with RetryInfo,
+// which OTLP clients need to retry the request, and no retry delay, so that clients
+// use their own backoff.
+func assertRefusedWithRetryInfo(t *testing.T, err error) {
+	t.Helper()
+
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.ResourceExhausted, st.Code())
+
+	var retryInfo *errdetails.RetryInfo
+	for _, detail := range st.Details() {
+		if ri, isRetryInfo := detail.(*errdetails.RetryInfo); isRetryInfo {
+			retryInfo = ri
+		}
+	}
+	require.NotNil(t, retryInfo)
+	assert.Nil(t, retryInfo.GetRetryDelay())
 }
 
 func TestGRPCStreamInterceptor_Normal(t *testing.T) {
@@ -317,7 +338,7 @@ func TestGRPCStreamInterceptor_Refused(t *testing.T) {
 	err := ml.grpcStreamInterceptor(nil, stream, nil, handler)
 
 	require.Error(t, err)
-	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
+	assertRefusedWithRetryInfo(t, err)
 	assert.False(t, called)
 
 	metadatatest.AssertEqualMemorylimiterRefusedRequests(

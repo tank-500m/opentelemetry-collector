@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -37,10 +38,21 @@ var (
 type memoryLimiterExtension struct {
 	memLimiter       *memorylimiter.MemoryLimiter
 	telemetryBuilder *metadata.TelemetryBuilder
+	// grpcRefusedErr is returned for refused gRPC requests.
+	grpcRefusedErr error
 }
 
 // newMemoryLimiter returns a new memorylimiter extension.
 func newMemoryLimiter(cfg *Config, logger *zap.Logger, telemetrySettings component.TelemetrySettings) (*memoryLimiterExtension, error) {
+	// OTLP clients retry RESOURCE_EXHAUSTED only if the status includes RetryInfo, see
+	// https://opentelemetry.io/docs/specs/otlp/#failures. No retry delay is set, so
+	// clients retry with their own backoff.
+	grpcRefusedStatus, err := status.New(codes.ResourceExhausted, "RESOURCE_EXHAUSTED").
+		WithDetails(&errdetails.RetryInfo{})
+	if err != nil {
+		return nil, err
+	}
+
 	telemetryBuilder, err := metadata.NewTelemetryBuilder(telemetrySettings)
 	if err != nil {
 		return nil, err
@@ -55,6 +67,7 @@ func newMemoryLimiter(cfg *Config, logger *zap.Logger, telemetrySettings compone
 	return &memoryLimiterExtension{
 		memLimiter:       ml,
 		telemetryBuilder: telemetryBuilder,
+		grpcRefusedErr:   grpcRefusedStatus.Err(),
 	}, nil
 }
 
@@ -107,7 +120,7 @@ func (ml *memoryLimiterExtension) grpcUnaryInterceptor(ctx context.Context, req 
 			1,
 			metric.WithAttributeSet(grpcTransportAttrs),
 		)
-		return nil, status.Errorf(codes.ResourceExhausted, "RESOURCE_EXHAUSTED")
+		return nil, ml.grpcRefusedErr
 	}
 
 	return handler(ctx, req)
@@ -122,7 +135,7 @@ func (ml *memoryLimiterExtension) grpcStreamInterceptor(srv any, ss grpc.ServerS
 			1,
 			metric.WithAttributeSet(grpcTransportAttrs),
 		)
-		return status.Errorf(codes.ResourceExhausted, "RESOURCE_EXHAUSTED")
+		return ml.grpcRefusedErr
 	}
 
 	return handler(srv, ss)
